@@ -285,9 +285,22 @@ def qualify(url):
 
 # ============================================================ CSV / ИМЯ ФАЙЛА
 
-CSV_FIELDS = ["score", "niche", "name", "phone", "url", "address", "platform",
-              "has_pay", "has_booking", "has_messenger", "mobile",
-              "copyright_year", "products", "angle", "note"]
+# только реально заполняемые поля, внутренний ключ -> русский заголовок
+CSV_FIELDS = ["score", "niche", "name", "phone", "url", "platform",
+              "has_pay", "has_booking", "has_messenger", "mobile", "copyright_year"]
+CSV_HEADERS_RU = {
+    "score":          "Скор",
+    "niche":          "Ниша",
+    "name":           "Название",
+    "phone":          "Телефон",
+    "url":            "Сайт",
+    "platform":       "Платформа",
+    "has_pay":        "Онлайн-оплата",
+    "has_booking":    "Онлайн-запись",
+    "has_messenger":  "Мессенджер",
+    "mobile":         "Моб. версия",
+    "copyright_year": "Год сайта",
+}
 
 
 def slugify(s: str) -> str:
@@ -311,12 +324,18 @@ def make_filename(city, niches):
     return f"{city_part}__{niche_part}.csv"
 
 
+def _fmt(val):
+    if isinstance(val, bool):
+        return "да" if val else "нет"
+    return val
+
+
 def write_csv(rows, out):
     with open(out, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
+        w = csv.writer(f)
+        w.writerow([CSV_HEADERS_RU[k] for k in CSV_FIELDS])   # русские заголовки
         for r in rows:
-            w.writerow(r)
+            w.writerow([_fmt(r.get(k, "")) for k in CSV_FIELDS])
 
 
 # ============================================================ ЯДРО
