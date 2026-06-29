@@ -47,6 +47,7 @@ class App(tk.Tk):
 
         self._build_search(self.tab_search)
         self._build_results(self.tab_results)
+        self._toggle_source()
 
         self.after(100, self._drain_log)
 
@@ -63,6 +64,26 @@ class App(tk.Tk):
         self.limit_var = tk.IntVar(value=60)
         ttk.Spinbox(top, from_=10, to=500, increment=10, width=6,
                     textvariable=self.limit_var).grid(row=0, column=3, sticky="w", padx=6)
+
+        ttk.Label(top, text="Источник:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.source_var = tk.StringVar(value="2gis")
+        src = ttk.Combobox(top, textvariable=self.source_var, width=27, state="readonly",
+                           values=["2gis", "osm"])
+        src.grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        src.bind("<<ComboboxSelected>>", lambda e: self._toggle_source())
+
+        ttk.Label(top, text="Мин. отзывов:").grid(row=1, column=2, sticky="e", padx=(20, 0), pady=(8, 0))
+        self.minrev_var = tk.IntVar(value=20)
+        self.minrev_sb = ttk.Spinbox(top, from_=0, to=10000, increment=5, width=6,
+                                     textvariable=self.minrev_var)
+        self.minrev_sb.grid(row=1, column=3, sticky="w", padx=6, pady=(8, 0))
+
+        ttk.Label(top, text="Ключ 2ГИС:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.key_var = tk.StringVar(value="")
+        self.key_entry = ttk.Entry(top, textvariable=self.key_var, width=46)
+        self.key_entry.grid(row=2, column=1, columnspan=3, sticky="we", padx=6, pady=(8, 0))
+        ttk.Label(top, text="(бесплатный ключ: dev.2gis.ru — отзывы есть только у 2ГИС, не у OSM)",
+                  foreground="#888").grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         nf = ttk.LabelFrame(root, text="Ниши (ничего не отмечено = все ниши)")
         nf.pack(fill="both", expand=True, **pad)
@@ -207,6 +228,12 @@ class App(tk.Tk):
         self._refresh_files()
 
     # ============================================================ общее
+    def _toggle_source(self):
+        on = self.source_var.get() == "2gis"
+        state = "normal" if on else "disabled"
+        self.key_entry["state"] = state
+        self.minrev_sb["state"] = state
+
     def _select_all(self):
         for v in self.niche_vars.values():
             v.set(True)
@@ -261,17 +288,27 @@ class App(tk.Tk):
         out_dir = self.dir_var.get().strip() or "."
         out = os.path.join(out_dir, lf.make_filename(city, niches))
 
+        source = self.source_var.get()
+        key = self.key_var.get().strip()
+        min_rev = max(0, int(self.minrev_var.get())) if source == "2gis" else 0
+        if source == "2gis" and not key:
+            messagebox.showwarning("Нужен ключ 2ГИС",
+                                   "Для фильтра по отзывам нужен бесплатный ключ 2ГИС.\n"
+                                   "Получить: dev.2gis.ru. Или выбери источник «osm» (без отзывов).")
+            return
+
         self.run_btn["state"] = "disabled"
         self.pb.start(12)
         self._logmsg(f"=== Старт. Файл: {os.path.basename(out)} ===")
         self.worker = threading.Thread(
-            target=self._work, args=(city, niches, limit, out), daemon=True)
+            target=self._work, args=(city, niches, limit, out, source, key, min_rev), daemon=True)
         self.worker.start()
 
-    def _work(self, city, niches, limit, out):
+    def _work(self, city, niches, limit, out, source, key, min_rev):
         try:
             rows, out = lf.run_search(city=city, niches=niches, limit=limit,
-                                      out=out, progress=self._logmsg)
+                                      out=out, progress=self._logmsg,
+                                      source=source, dgis_key=key, min_reviews=min_rev)
             self.result_path = out
             hot = sum(1 for r in rows if r["score"] >= 70)
             self._logmsg(f"Горячих лидов (скор ≥ 70): {hot} из {len(rows)}")

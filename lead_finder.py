@@ -40,6 +40,8 @@ OVERPASS_MIRRORS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
+DGIS_ITEMS = "https://catalog.api.2gis.com/3.0/items"
+
 # ---------- ниша (человекочитаемо) -> OSM-фильтры (key, value) ----------
 NICHES = {
     # авто
@@ -205,6 +207,89 @@ def discover_osm(niches, city, limit=60):
     return out[:limit]
 
 
+# ============================================================ DISCOVERY (2ГИС)
+
+def _dgis_contacts(item):
+    """Из 2ГИС-объекта вытащить телефон и сайт."""
+    phone, site = "", ""
+    for g in item.get("contact_groups", []):
+        for c in g.get("contacts", []):
+            t = c.get("type")
+            if t == "phone" and not phone:
+                phone = c.get("value", "")
+            elif t in ("website", "url") and not site:
+                site = c.get("url") or c.get("value") or ""
+    return phone.strip(), site.strip()
+
+
+def discover_2gis(niches, city, key, limit=60, min_reviews=0, progress=None):
+    """2ГИС-каталог: организации с числом отзывов. Возвращает список бизнесов.
+
+    min_reviews — оставить только с отзывами >= min_reviews.
+    """
+    log = progress or print
+    out, seen = [], set()
+    per_niche = max(10, limit // max(1, len(niches)))
+
+    for niche in niches:
+        page = 1
+        got = 0
+        while got < per_niche:
+            try:
+                r = requests.get(DGIS_ITEMS, params={
+                    "q": f"{niche} {city}",
+                    "fields": "items.reviews,items.contact_groups,items.address",
+                    "page": page, "page_size": 50, "key": key,
+                }, headers={"User-Agent": UA}, timeout=30)
+                data = r.json()
+            except Exception as e:
+                log(f"  2ГИС '{niche}': ошибка сети {e}")
+                break
+
+            meta = data.get("meta", {})
+            if meta.get("error"):
+                msg = meta["error"].get("message", "")
+                log(f"  2ГИС: {msg}")
+                if meta["error"].get("type") in ("authError", "accessDenied"):
+                    return []          # плохой ключ — дальше бессмысленно
+                break
+
+            items = data.get("result", {}).get("items", [])
+            if not items:
+                break
+
+            for it in items:
+                rv = it.get("reviews", {}) or {}
+                rc = int(rv.get("general_review_count") or 0)
+                if rc < min_reviews:
+                    continue
+                name = it.get("name", "")
+                if not name:
+                    continue
+                k = (name.lower(), it.get("address_name", ""))
+                if k in seen:
+                    continue
+                seen.add(k)
+                phone, site = _dgis_contacts(it)
+                out.append({
+                    "name": name, "url": site, "phone": phone,
+                    "address": it.get("address_name", ""), "niche": niche,
+                    "reviews": rc, "rating": rv.get("general_rating", ""),
+                })
+                got += 1
+
+            total = meta.get("total") or 0
+            if page * 50 >= total:
+                break
+            page += 1
+
+        log(f"  2ГИС '{niche}': подходит {got} (отзывов >= {min_reviews})")
+
+    # больше отзывов = выше в списке
+    out.sort(key=lambda b: b.get("reviews", 0), reverse=True)
+    return out[:limit]
+
+
 # ============================================================ QUALIFY
 
 def normalize(url):
@@ -286,10 +371,12 @@ def qualify(url):
 # ============================================================ CSV / ИМЯ ФАЙЛА
 
 # только реально заполняемые поля, внутренний ключ -> русский заголовок
-CSV_FIELDS = ["score", "niche", "name", "phone", "url", "platform",
+CSV_FIELDS = ["score", "reviews", "rating", "niche", "name", "phone", "url", "platform",
               "has_pay", "has_booking", "has_messenger", "mobile", "copyright_year"]
 CSV_HEADERS_RU = {
     "score":          "Скор",
+    "reviews":        "Отзывы",
+    "rating":         "Рейтинг",
     "niche":          "Ниша",
     "name":           "Название",
     "phone":          "Телефон",
@@ -340,9 +427,12 @@ def write_csv(rows, out):
 
 # ============================================================ ЯДРО
 
-def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=None):
+def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=None,
+               source="osm", dgis_key="", min_reviews=0):
     """Поиск + квалификация + запись CSV. progress(msg) — колбэк для лога.
 
+    source: "osm" (без отзывов) или "2gis" (с отзывами, нужен dgis_key).
+    min_reviews: для 2gis — оставить только с отзывами >= min_reviews.
     Возвращает (rows, out_path).
     """
     log = progress or print
@@ -350,8 +440,14 @@ def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=N
     if city:
         niches = niches or list(NICHES.keys())
         niches = [n for n in niches if n in NICHES]
-        log(f"Ищу {len(niches)} ниш в '{city}' через OpenStreetMap...")
-        biz = discover_osm(niches, city, limit)
+        if source == "2gis":
+            if not dgis_key:
+                raise ValueError("для 2ГИС нужен API-ключ")
+            log(f"Ищу {len(niches)} ниш в '{city}' через 2ГИС (отзывов >= {min_reviews})...")
+            biz = discover_2gis(niches, city, dgis_key, limit, min_reviews, progress=log)
+        else:
+            log(f"Ищу {len(niches)} ниш в '{city}' через OpenStreetMap...")
+            biz = discover_osm(niches, city, limit)
         ws = sum(1 for b in biz if b["url"])
         ph = sum(1 for b in biz if b["phone"])
         log(f"Взял {len(biz)} организаций | с сайтом: {ws} | с телефоном: {ph}")
@@ -383,7 +479,8 @@ def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=N
                           + ("" if reachable else " (нет телефона — сложно достучаться)"),
                  "note": "сайт не найден"}
             log(f"  [нет сайта] {b['name'][:40]}")
-        q.update(name=b["name"], phone=b["phone"], address=b["address"], niche=b["niche"])
+        q.update(name=b["name"], phone=b["phone"], address=b["address"], niche=b["niche"],
+                 reviews=b.get("reviews", ""), rating=b.get("rating", ""))
         rows.append(q)
 
     rows.sort(key=lambda x: x["score"], reverse=True)
@@ -402,6 +499,10 @@ def main():
     ap.add_argument("--limit", type=int, default=60)
     ap.add_argument("--list-niches", action="store_true")
     ap.add_argument("--out", default=None, help="имя CSV (по умолчанию — ниша+город)")
+    ap.add_argument("--source", choices=["osm", "2gis"], default="osm",
+                    help="osm (без отзывов) или 2gis (с отзывами, нужен --dgis-key)")
+    ap.add_argument("--dgis-key", default="", help="API-ключ 2ГИС")
+    ap.add_argument("--min-reviews", type=int, default=0, help="мин. число отзывов (только 2gis)")
     args = ap.parse_args()
 
     if args.list_niches:
@@ -418,7 +519,8 @@ def main():
         ap.error("дай --city (+ опц. --niches) или --urls")
 
     rows, out = run_search(city=args.city, niches=args.niches, urls=args.urls,
-                           limit=args.limit, out=args.out)
+                           limit=args.limit, out=args.out, source=args.source,
+                           dgis_key=args.dgis_key, min_reviews=args.min_reviews)
 
     print(f"\n{'СКОР':>4}  {'НИША':<16} {'ТЕЛЕФОН':<18} {'САЙТ'}")
     print("-" * 78)
