@@ -197,9 +197,13 @@ def discover_osm(niches, city, limit=60):
         street = t.get("addr:street", "")
         house = t.get("addr:housenumber", "")
         addr = (street + " " + house).strip()
+        if "center" in el:
+            lat, lon = el["center"].get("lat"), el["center"].get("lon")
+        else:
+            lat, lon = el.get("lat"), el.get("lon")
         out.append({
             "name": name, "url": site.strip(), "phone": phone.strip(),
-            "address": addr, "niche": classify_niche(t),
+            "address": addr, "niche": classify_niche(t), "lat": lat, "lon": lon,
         })
 
     # сначала те, кого реально можно обработать/достать: есть сайт -> есть телефон -> остальные
@@ -207,87 +211,68 @@ def discover_osm(niches, city, limit=60):
     return out[:limit]
 
 
-# ============================================================ DISCOVERY (2ГИС)
+# ============================================================ ОТЗЫВЫ (2ГИС)
+#
+# На бесплатном ключе 2ГИС не отдаёт телефоны/сайты (поле contact_groups закрыто),
+# но отдаёт reviews (число отзывов + рейтинг). Поэтому: контакты берём из OSM,
+# а число отзывов «доклеиваем» из 2ГИС по названию + координатам организации.
 
-def _dgis_contacts(item):
-    """Из 2ГИС-объекта вытащить телефон и сайт."""
-    phone, site = "", ""
-    for g in item.get("contact_groups", []):
-        for c in g.get("contacts", []):
-            t = c.get("type")
-            if t == "phone" and not phone:
-                phone = c.get("value", "")
-            elif t in ("website", "url") and not site:
-                site = c.get("url") or c.get("value") or ""
-    return phone.strip(), site.strip()
+def _name_key(s):
+    """Первое значимое слово названия в нижнем регистре (для сверки совпадения)."""
+    s = re.sub(r"[«»\"',.()]", " ", (s or "").lower())
+    for w in s.split():
+        if len(w) >= 3:
+            return w
+    return s.strip()
 
 
-def discover_2gis(niches, city, key, limit=60, min_reviews=0, progress=None):
-    """2ГИС-каталог: организации с числом отзывов. Возвращает список бизнесов.
+def enrich_reviews_2gis(businesses, city, key, progress=None):
+    """Для каждого бизнеса из OSM достаёт число отзывов из 2ГИС по имени+координатам.
 
-    min_reviews — оставить только с отзывами >= min_reviews.
+    Пишет b['reviews'] (int) и b['rating']. Совпадение проверяем по первому
+    слову названия, чтобы не приклеить отзывы чужой организации.
     """
     log = progress or print
-    out, seen = [], set()
-    per_niche = max(10, limit // max(1, len(niches)))
+    done = 0
+    for b in businesses:
+        b.setdefault("reviews", "")
+        b.setdefault("rating", "")
+        name, lat, lon = b.get("name", ""), b.get("lat"), b.get("lon")
+        if not name:
+            continue
+        params = {"q": f"{name} {city}", "fields": "items.reviews,items.point",
+                  "page": 1, "page_size": 5, "key": key}
+        if lat is not None and lon is not None:
+            params["point"] = f"{lon},{lat}"
+            params["radius"] = 1000          # м: ограничить тем же местом
+            params["sort"] = "distance"
+        try:
+            r = requests.get(DGIS_ITEMS, params=params,
+                             headers={"User-Agent": UA}, timeout=30)
+            data = r.json()
+        except Exception as e:
+            log(f"  2ГИС '{name[:25]}': сеть {e}")
+            continue
 
-    for niche in niches:
-        page = 1
-        got = 0
-        while got < per_niche:
-            try:
-                r = requests.get(DGIS_ITEMS, params={
-                    "q": f"{niche} {city}",
-                    "fields": "items.reviews,items.contact_groups,items.address",
-                    "page": page, "page_size": 50, "key": key,
-                }, headers={"User-Agent": UA}, timeout=30)
-                data = r.json()
-            except Exception as e:
-                log(f"  2ГИС '{niche}': ошибка сети {e}")
-                break
+        err = data.get("meta", {}).get("error")
+        if err:
+            log(f"  2ГИС: {err.get('message', '')}")
+            if err.get("type") in ("authError", "accessDenied"):
+                break                        # плохой ключ — дальше бессмысленно
+            continue
 
-            meta = data.get("meta", {})
-            if meta.get("error"):
-                msg = meta["error"].get("message", "")
-                log(f"  2ГИС: {msg}")
-                if meta["error"].get("type") in ("authError", "accessDenied"):
-                    return []          # плохой ключ — дальше бессмысленно
-                break
-
-            items = data.get("result", {}).get("items", [])
-            if not items:
-                break
-
-            for it in items:
-                rv = it.get("reviews", {}) or {}
-                rc = int(rv.get("general_review_count") or 0)
-                if rc < min_reviews:
-                    continue
-                name = it.get("name", "")
-                if not name:
-                    continue
-                k = (name.lower(), it.get("address_name", ""))
-                if k in seen:
-                    continue
-                seen.add(k)
-                phone, site = _dgis_contacts(it)
-                out.append({
-                    "name": name, "url": site, "phone": phone,
-                    "address": it.get("address_name", ""), "niche": niche,
-                    "reviews": rc, "rating": rv.get("general_rating", ""),
-                })
-                got += 1
-
-            total = meta.get("total") or 0
-            if page * 50 >= total:
-                break
-            page += 1
-
-        log(f"  2ГИС '{niche}': подходит {got} (отзывов >= {min_reviews})")
-
-    # больше отзывов = выше в списке
-    out.sort(key=lambda b: b.get("reviews", 0), reverse=True)
-    return out[:limit]
+        want = _name_key(name)
+        for it in data.get("result", {}).get("items", []):
+            if _name_key(it.get("name", "")) != want:
+                continue                     # не та организация
+            rv = it.get("reviews", {}) or {}
+            b["reviews"] = int(rv.get("general_review_count") or 0)
+            b["rating"] = rv.get("general_rating", "")
+            break
+        done += 1
+        if done % 10 == 0:
+            log(f"  ...сверено отзывов: {done}/{len(businesses)}")
+    return businesses
 
 
 # ============================================================ QUALIFY
@@ -443,8 +428,18 @@ def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=N
         if source == "2gis":
             if not dgis_key:
                 raise ValueError("для 2ГИС нужен API-ключ")
-            log(f"Ищу {len(niches)} ниш в '{city}' через 2ГИС (отзывов >= {min_reviews})...")
-            biz = discover_2gis(niches, city, dgis_key, limit, min_reviews, progress=log)
+            # OSM даёт телефон/сайт, 2ГИС — число отзывов. Берём с запасом, потом фильтр+топ.
+            # Кап на сверки: каждая = запрос к 2ГИС, не раздуваем время.
+            cand = min(max(limit * 2, 40), 80)
+            log(f"Ищу {len(niches)} ниш в '{city}' через OpenStreetMap...")
+            biz = discover_osm(niches, city, limit=cand)
+            log(f"Сверяю отзывы по {len(biz)} организациям через 2ГИС...")
+            enrich_reviews_2gis(biz, city, dgis_key, progress=log)
+            before = len(biz)
+            biz = [b for b in biz if (b.get("reviews") or 0) >= min_reviews]
+            biz.sort(key=lambda b: (b.get("reviews") or 0), reverse=True)
+            biz = biz[:limit]
+            log(f"Отзывов >= {min_reviews}: {len(biz)} из {before} (топ по отзывам)")
         else:
             log(f"Ищу {len(niches)} ниш в '{city}' через OpenStreetMap...")
             biz = discover_osm(niches, city, limit)
@@ -483,7 +478,10 @@ def run_search(city=None, niches=None, urls=None, limit=60, out=None, progress=N
                  reviews=b.get("reviews", ""), rating=b.get("rating", ""))
         rows.append(q)
 
-    rows.sort(key=lambda x: x["score"], reverse=True)
+    if source == "2gis":
+        rows.sort(key=lambda x: ((x.get("reviews") or 0), x["score"]), reverse=True)
+    else:
+        rows.sort(key=lambda x: x["score"], reverse=True)
     write_csv(rows, out)
     log(f"Готово -> {out}  (всего лидов: {len(rows)})")
     return rows, out

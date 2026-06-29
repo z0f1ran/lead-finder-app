@@ -71,6 +71,9 @@ class App(tk.Tk):
                            values=["2gis", "osm"])
         src.grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
         src.bind("<<ComboboxSelected>>", lambda e: self._toggle_source())
+        self.src_hint = ttk.Label(top, text="2gis = телефон/сайт из карты + отзывы из 2ГИС, топ по отзывам (медленнее)",
+                                  foreground="#888")
+        self.src_hint.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         ttk.Label(top, text="Мин. отзывов:").grid(row=1, column=2, sticky="e", padx=(20, 0), pady=(8, 0))
         self.minrev_var = tk.IntVar(value=20)
